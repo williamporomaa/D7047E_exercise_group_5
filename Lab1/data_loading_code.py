@@ -22,7 +22,7 @@ def preprocess_pandas(data, columns):
     for index, row in data.iterrows():
         word_tokens = word_tokenize(row['Sentence'])
         filtered_sent = [w for w in word_tokens if not w in stopwords.words('english')]
-        df_ = df_.append({
+        df_ = df_._append({
             "index": row['index'],
             "Class": row['Class'],
             "Sentence": " ".join(filtered_sent[0:])
@@ -32,7 +32,7 @@ def preprocess_pandas(data, columns):
 # If this is the primary file that is executed (ie not an import of another file)
 if __name__ == "__main__":
     # get data, pre-process and split
-    data = pd.read_csv("amazon_cells_labelled.txt", delimiter='\t', header=None)
+    data = pd.read_csv("Lab1/amazon_cells_labelled.txt", delimiter='\t', header=None)
     data.columns = ['Sentence', 'Class']
     data['index'] = data.index                                          # add new column index
     columns = ['index', 'Class', 'Sentence']
