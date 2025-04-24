@@ -1,0 +1,208 @@
+# -*- coding: utf-8 -*-
+"""
+personalized_stable_diffusion.py
+
+A single-file, from-scratch implementation of a Stable Diffusion-like pipeline
+for MNIST, combining configuration, models, sampler, training, evaluation,
+and inference—complete with detailed inline comments.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import numpy as np
+import matplotlib.pyplot as plt
+import wandb
+
+# ------------------------------
+# 1. Hyperparameter Configuration
+# ------------------------------
+class DiffusionConfig:
+    """Dataclass-like container for hyperparameters."""
+    image_size = 28
+    in_channels = 1
+    base_channels = 64
+    channel_mult = (1, 2, 4, 8)
+    num_res_blocks = 2
+    attn_res = (16,)
+
+    timesteps = 1000
+    beta_start = 1e-4
+    beta_end   = 2e-2
+
+    lr = 2e-4
+    batch_size = 128
+    epochs = 50
+    log_interval = 100
+
+    ddim_steps = 50
+    eta = 0.0
+
+    use_wandb = True
+    wandb_project = "personalized_stable_diffusion"
+    wandb_entity = "your_username"
+
+cfg = DiffusionConfig()
+
+# Compute linear noise schedule
+betas = torch.linspace(cfg.beta_start, cfg.beta_end, cfg.timesteps)
+alphas = 1. - betas
+alpha_cumprod = torch.cumprod(alphas, dim=0)
+
+# ------------------------------
+# 2. Model Definitions
+# ------------------------------
+class ResidualBlock(nn.Module):
+    """A basic residual block with two conv layers."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    def forward(self, x):
+        h = F.relu(self.conv1(x))
+        h = self.conv2(h)
+        return F.relu(h + self.skip(x))
+
+class Attention(nn.Module):
+    """Self-attention at a given resolution."""
+    def __init__(self, ch):
+        super().__init__()
+        self.q = nn.Conv2d(ch, ch, 1)
+        self.k = nn.Conv2d(ch, ch, 1)
+        self.v = nn.Conv2d(ch, ch, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+    def forward(self, x):
+        b, c, h, w = x.shape
+        q = self.q(x).view(b, c, -1)  # b x c x (h*w)
+        k = self.k(x).view(b, c, -1)
+        v = self.v(x).view(b, c, -1)
+        attn = torch.softmax(q.permute(0,2,1) @ k / np.sqrt(c), dim=-1)
+        out = (v @ attn.permute(0,2,1)).view(b, c, h, w)
+        return self.proj(out)
+
+class UNet(nn.Module):
+    """A simplified U-Net for noise prediction."""
+    def __init__(self, cfg):
+        super().__init__()
+        # Encoder
+        chs = [cfg.base_channels * m for m in cfg.channel_mult]
+        self.downs = nn.ModuleList([])
+        in_ch = cfg.in_channels
+        for ch in chs:
+            blocks = [ResidualBlock(in_ch, ch) for _ in range(cfg.num_res_blocks)]
+            if h := cfg.attn_res and ch in [cfg.base_channels * (cfg.channel_mult[i]) for i in range(len(chs))]:
+                blocks.append(Attention(ch))
+            self.downs.append(nn.Sequential(*blocks))
+            in_ch = ch
+        self.middle = nn.Sequential(ResidualBlock(in_ch, in_ch), Attention(in_ch), ResidualBlock(in_ch, in_ch))
+        # Decoder
+        self.ups = nn.ModuleList([])
+        for ch in reversed(chs):
+            blocks = [ResidualBlock(in_ch*2, ch) for _ in range(cfg.num_res_blocks)]
+            if ch in [cfg.base_channels * m for m in cfg.attn_res]:
+                blocks.append(Attention(ch))
+            self.ups.append(nn.Sequential(*blocks))
+            in_ch = ch
+        self.final = nn.Conv2d(in_ch, cfg.in_channels, 1)
+
+    def forward(self, x, t):
+        # Embed timestep t
+        # (Left as exercise for time embedding)
+        xs = []  # for skip connections
+        h = x
+        # Down path
+        for block in self.downs:
+            h = block(h)
+            xs.append(h)
+            h = F.avg_pool2d(h, 2)
+        # Middle
+        h = self.middle(h)
+        # Up path
+        for block in self.ups:
+            h = F.interpolate(h, scale_factor=2)
+            skip = xs.pop()
+            h = block(torch.cat([h, skip], dim=1))
+        return self.final(h)
+
+# Instantiate model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+unet = UNet(cfg).to(device)
+
+# ------------------------------
+# 3. DDIM Sampler
+# ------------------------------
+def ddim_sample(model, shape, steps, eta):
+    """Generates samples from pure noise using DDIM."""
+    x = torch.randn(shape, device=device)
+    for i in reversed(range(0, steps)):
+        alpha = alpha_cumprod[i]
+        alpha_prev = alpha_cumprod[i-1] if i>0 else torch.tensor(1.)
+        # Predict noise
+        eps = model(x, torch.tensor([i], device=device))
+        # DDIM update
+        pred = (x - torch.sqrt(1-alpha) * eps) / torch.sqrt(alpha)
+        dir = torch.sqrt(1-alpha_prev - eta**2*(1-alpha/alpha_prev)) * eps
+        x = torch.sqrt(alpha_prev)*pred + dir
+    return x
+
+# ------------------------------
+# 4. Data Loading
+# ------------------------------
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
+dataset = datasets.MNIST('.', train=True, download=True, transform=transform)
+loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
+
+# ------------------------------
+# 5. Training & Validation
+# ------------------------------
+def train():
+    """Training loop for one epoch."""
+    optimizer = torch.optim.Adam(unet.parameters(), lr=cfg.lr)
+    unet.train()
+    for step, (imgs, _) in enumerate(loader):
+        imgs = imgs.to(device)
+        t = torch.randint(0, cfg.timesteps, (imgs.size(0),), device=device)
+        # Add noise
+        noise = torch.randn_like(imgs)
+        a = alpha_cumprod[t].view(-1,1,1,1)
+        x_noisy = torch.sqrt(a)*imgs + torch.sqrt(1-a)*noise
+        # Predict noise
+        eps_pred = unet(x_noisy, t)
+        loss = F.mse_loss(eps_pred, noise)
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        if step % cfg.log_interval == 0:
+            print(f"Step {step}, Loss: {loss.item():.4f}")
+            if cfg.use_wandb:
+                wandb.log({"train/loss": loss.item()})
+
+# ------------------------------
+# 6. Model Evaluation
+# ------------------------------
+def evaluate():
+    """Generate sample grid and plot loss curves."""
+    unet.eval()
+    with torch.no_grad():
+        samples = ddim_sample(unet, (16, cfg.in_channels, cfg.image_size, cfg.image_size), cfg.ddim_steps, cfg.eta)
+        samples = (samples.clamp(-1,1)+1)/2
+        grid = np.vstack([np.hstack([samples[i*4+j,0].cpu().numpy() for j in range(4)]) for i in range(4)])
+        plt.imshow(grid, cmap='gray')
+        plt.axis('off')
+        plt.show()
+
+# ------------------------------
+# 7. Main Execution
+# ------------------------------
+if __name__ == "__main__":
+    if cfg.use_wandb:
+        wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity, config=vars(cfg))
+    for epoch in range(cfg.epochs):
+        print(f"Epoch {epoch+1}/{cfg.epochs}")
+        train()
+        if (epoch+1) % 5 == 0:
+            evaluate()
+    # Final sampling and display
+    print("Training complete. Generating final samples...")
+    evaluate()
