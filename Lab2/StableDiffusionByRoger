@@ -1,0 +1,1407 @@
+# Consolidated Stable Diffusion Implementation - By Roger (Student Mode!)
+# Target File Structure:
+#   - config/hyperparameters.py
+#   - core_models/variational_autoencoder.py
+#   - core_models/noise_predictor_unet.py
+#   - core_models/text_encoder_interface.py
+#   - sampling/diffusion_scheduler.py
+#   - sampling/ddim_sampler.py
+#   - training/dataset_handler.py
+#   - training/loss_functions.py
+#   - training/training_loop.py
+#   - evaluation/visualization.py
+#   - inference/generate_samples.py
+#   - utils/helpers.py
+#   - utils/wandb_integration.py
+#   - main_runner.py
+
+# --- Imports ---
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from tqdm import tqdm
+from PIL import Image
+import numpy as np
+import os
+
+# Potentially needed libraries (install if necessary)
+# !pip install torch torchvision torchaudio
+# !pip install transformers accelerate # For CLIP
+# !pip install diffusers # Often used for VAE/Scheduler examples, though we implement parts ourselves
+# !pip install tqdm Pillow numpy
+# !pip install wandb # For experiment tracking (currently commented out)
+
+# --- Configuration (Simulates config/hyperparameters.py) ---
+
+class TrainingConfig:
+    """
+    Central configuration class to hold all hyperparameters.
+    Makes it easy to tune experiments!
+    """
+    # Data and Model Parameters
+    image_size = 64  # Target image resolution (e.g., 64x64 pixels)
+    latent_dim_scale_factor = 8 # VAE downsamples image_size by this factor
+    latent_channels = 4  # Number of channels in the VAE's latent space
+    text_embedding_dim = 768  # Dimension of CLIP text embeddings (standard for base models)
+
+    # UNet Parameters
+    unet_block_out_channels = (128, 256, 512, 512) # Channel sizes for UNet down/up blocks
+    unet_layers_per_block = 2 # Number of residual blocks per UNet stage
+    unet_attention_head_dim = 8 # Number of attention heads
+    unet_time_embedding_dim = 256 # Dimension for the time step embedding
+
+    # Diffusion Parameters
+    num_diffusion_timesteps = 1000 # Total number of steps in the forward diffusion process (T)
+    beta_schedule = "linear" # Variance schedule type ('linear', 'cosine')
+    beta_start = 0.00085 # Starting beta value
+    beta_end = 0.0120 # Ending beta value
+
+    # Training Parameters
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    learning_rate = 1e-4
+    adam_beta1 = 0.9
+    adam_beta2 = 0.999
+    adam_weight_decay = 1e-2
+    adam_epsilon = 1e-08
+    num_epochs = 50 # Number of training epochs
+    train_batch_size = 4 # Adjust based on your GPU memory
+    gradient_accumulation_steps = 1 # Accumulate gradients over N steps
+    log_frequency = 100 # Log loss every N steps
+    save_image_frequency = 500 # Generate and save sample images every N steps
+    save_model_frequency = 1000 # Save model checkpoint every N steps
+    mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
+
+    # Inference Parameters
+    num_inference_steps = 50 # Number of steps for DDIM sampling (must be <= num_diffusion_timesteps)
+    guidance_scale = 7.5 # Classifier-Free Guidance scale
+
+    # Paths
+    output_dir = "diffusion_output" # Directory to save results
+    pretrained_vae_name_or_path = "stabilityai/sd-vae-ft-mse" # Example pre-trained VAE
+    pretrained_clip_name_or_path = "openai/clip-vit-large-patch14" # Example pre-trained CLIP
+
+    # --- WandB Configuration (Commented Out) ---
+    # wandb_project_name = "stable_diffusion_from_scratch_roger"
+    # wandb_run_name = None # Set specific run name or leave as None for auto-generation
+    # use_wandb = False # Set to True to enable WandB logging
+
+# Instantiate the config
+config = TrainingConfig()
+
+# Create output directory if it doesn't exist
+os.makedirs(config.output_dir, exist_ok=True)
+
+
+# --- Utility Functions (Simulates utils/helpers.py & utils/wandb_integration.py) ---
+
+def save_checkpoint(model, optimizer, scheduler, epoch, step, file_path):
+    """Saves the model, optimizer, and scheduler state."""
+    state = {
+        'epoch': epoch,
+        'step': step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+    }
+    torch.save(state, file_path)
+    print(f"Checkpoint saved to {file_path}")
+
+def load_checkpoint(model, optimizer, scheduler, file_path, device):
+    """Loads the model, optimizer, and scheduler state."""
+    if not os.path.isfile(file_path):
+        print(f"Checkpoint file not found: {file_path}")
+        return 0, 0 # Return epoch 0, step 0
+    checkpoint = torch.load(file_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    if optimizer and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    epoch = checkpoint['epoch']
+    step = checkpoint['step']
+    print(f"Checkpoint loaded from {file_path} (Epoch {epoch}, Step {step})")
+    return epoch, step
+
+# --- WandB Integration Functions (Commented Out) ---
+# import wandb
+
+# def setup_wandb(config_dict):
+#     """Initializes a WandB run."""
+#     if not config.use_wandb:
+#         return None
+#     run = wandb.init(
+#         project=config.wandb_project_name,
+#         name=config.wandb_run_name,
+#         config=config_dict # Pass hyperparameters to WandB
+#     )
+#     print("WandB run initialized.")
+#     return run
+
+# def log_to_wandb(metrics_dict, step=None):
+#     """Logs metrics to WandB."""
+#     if config.use_wandb and wandb.run is not None:
+#         wandb.log(metrics_dict, step=step)
+
+# def get_wandb_sweep_config():
+#     """Defines a sample hyperparameter sweep configuration for WandB."""
+#     sweep_configuration = {
+#         'method': 'bayes', # Or 'grid', 'random'
+#         'name': 'stable_diffusion_sweep_roger',
+#         'metric': {'goal': 'minimize', 'name': 'val_loss'}, # Example metric to optimize
+#         'parameters': {
+#             'learning_rate': {'min': 1e-5, 'max': 1e-3, 'distribution': 'log_uniform_values'},
+#             'train_batch_size': {'values': [2, 4, 8]},
+#             'guidance_scale': {'min': 3.0, 'max': 10.0},
+#             # Add other hyperparameters you want to sweep
+#         }
+#     }
+#     return sweep_configuration
+
+# --- Core Models: VAE Wrapper (Simulates core_models/variational_autoencoder.py) ---
+
+class VariationalAutoencoderWrapper(nn.Module):
+    """
+    A wrapper for a pre-trained VAE (like one from stabilityai or diffusers).
+    Handles encoding images to the latent space and decoding latents back to images.
+    """
+    def __init__(self, model_name_or_path, device):
+        super().__init__()
+        self.device = device
+        try:
+            # Using diffusers library to load a common VAE format
+            from diffusers import AutoencoderKL
+            self.vae = AutoencoderKL.from_pretrained(model_name_or_path)
+        except ImportError:
+            print("Please install diffusers: pip install diffusers accelerate")
+            # You might need to implement loading differently if not using diffusers
+            # or provide a direct path to compatible model weights.
+            raise
+        except Exception as e:
+            print(f"Error loading VAE from {model_name_or_path}: {e}")
+            print("Make sure the path/name is correct and you have internet access if needed.")
+            raise
+
+        # Freeze VAE parameters - we don't train it during diffusion training
+        self.vae.requires_grad_(False)
+        self.vae.to(self.device)
+
+        # The VAE scales the latent space dimensions. Calculate this based on image size.
+        self.latent_scale_factor = config.latent_dim_scale_factor # How much the VAE downsamples
+
+    @torch.no_grad() # Ensure no gradients are computed for VAE operations
+    def encode(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Encodes a batch of images into latent distributions.
+        Args:
+            pixel_values (torch.Tensor): Batch of images, shape (batch, channels, height, width).
+                                        Expected to be normalized, e.g., [-1, 1].
+        Returns:
+            torch.Tensor: Latent representations (samples from the distribution),
+                          shape (batch, latent_channels, height/scale_factor, width/scale_factor).
+        """
+        # The VAE outputs a distribution object. We need the sample (often called 'mode' or 'sample').
+        latent_dist = self.vae.encode(pixel_values.to(self.device)).latent_dist
+        # Sample from the distribution (deterministic for inference usually)
+        latents = latent_dist.sample()
+        # Apply scaling factor often used in Stable Diffusion
+        # 0.18215 is a magic number from the original SD work - helps normalize latent variance
+        latents = latents * 0.18215
+        return latents
+
+    @torch.no_grad() # Ensure no gradients are computed for VAE operations
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Decodes a batch of latent representations back into images.
+        Args:
+            latents (torch.Tensor): Batch of latents, shape (batch, latent_channels, height/sf, width/sf).
+        Returns:
+            torch.Tensor: Reconstructed images, shape (batch, channels, height, width), values usually in [-1, 1].
+        """
+        # Reverse the scaling factor before decoding
+        latents = latents / 0.18215
+        # Decode the latents
+        image = self.vae.decode(latents.to(self.device)).sample
+        return image
+
+# --- Core Models: Text Encoder Wrapper (Simulates core_models/text_encoder_interface.py) ---
+
+class TextEncoderInterface(nn.Module):
+    """
+    A wrapper for a pre-trained text encoder (like CLIP).
+    Handles tokenizing text and generating conditioning embeddings.
+    """
+    def __init__(self, model_name_or_path, device):
+        super().__init__()
+        self.device = device
+        try:
+            from transformers import CLIPTextModel, CLIPTokenizer
+            self.tokenizer = CLIPTokenizer.from_pretrained(model_name_or_path)
+            self.text_encoder = CLIPTextModel.from_pretrained(model_name_or_path)
+        except ImportError:
+            print("Please install transformers: pip install transformers accelerate")
+            raise
+        except Exception as e:
+            print(f"Error loading CLIP model from {model_name_or_path}: {e}")
+            print("Make sure the path/name is correct and you have internet access.")
+            raise
+
+        # Freeze text encoder parameters
+        self.text_encoder.requires_grad_(False)
+        self.text_encoder.to(self.device)
+        self.max_length = self.tokenizer.model_max_length # Get max sequence length
+
+    @torch.no_grad()
+    def forward(self, text_prompts: list[str]) -> torch.Tensor:
+        """
+        Encodes a list of text prompts into embedding vectors.
+        Args:
+            text_prompts (list[str]): A list of text strings.
+        Returns:
+            torch.Tensor: Text embeddings, shape (batch_size, sequence_length, embedding_dim).
+                          Usually, we take the `last_hidden_state`.
+        """
+        # Tokenize the text: Pad to max length and truncate if needed.
+        text_inputs = self.tokenizer(
+            text_prompts,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt" # Return PyTorch tensors
+        )
+        input_ids = text_inputs.input_ids.to(self.device)
+        attention_mask = text_inputs.attention_mask.to(self.device) # Needed if model uses it
+
+        # Get embeddings from the text encoder
+        # We usually want the 'last_hidden_state' which contains embeddings for each token.
+        text_embeddings = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        return text_embeddings
+
+    @torch.no_grad()
+    def get_unconditional_embedding(self, batch_size: int) -> torch.Tensor:
+        """
+        Generates the unconditional embedding (often based on an empty string).
+        Used for Classifier-Free Guidance.
+        Args:
+            batch_size (int): The number of unconditional embeddings needed.
+        Returns:
+            torch.Tensor: Unconditional text embeddings.
+        """
+        # Encode an empty string or padding tokens, depending on common practice
+        empty_prompts = [""] * batch_size
+        unconditional_embeddings = self.forward(empty_prompts)
+        return unconditional_embeddings
+
+
+# --- Core Models: UNet Components (Inside core_models/noise_predictor_unet.py) ---
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """
+    Transforms scalar time steps into fixed-size vector embeddings using sine and cosine functions.
+    This allows the UNet to be conditioned on the noise level (timestep).
+    """
+    def __init__(self, time_embedding_dim: int):
+        super().__init__()
+        if time_embedding_dim % 2 != 0:
+            raise ValueError(f"Time embedding dimension {time_embedding_dim} must be even.")
+        self.embedding_dim = time_embedding_dim
+
+    def forward(self, time_steps: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            time_steps (torch.Tensor): Batch of time steps, shape (batch_size,).
+        Returns:
+            torch.Tensor: Time embeddings, shape (batch_size, embedding_dim).
+        """
+        # Based on the "Attention Is All You Need" paper's positional encoding
+        half_dim = self.embedding_dim // 2
+        # Create frequency values (denominator term) - log scale from 1 to 10000
+        frequencies = torch.exp(
+            -math.log(10000.0) * torch.arange(half_dim, dtype=torch.float32) / half_dim
+        ).to(time_steps.device)
+
+        # Calculate arguments for sin and cos: time_steps * frequencies
+        time_args = time_steps.float()[:, None] * frequencies[None, :] # Use float for time_steps
+
+        # Calculate embeddings and concatenate sin and cos components
+        time_embeddings = torch.cat((torch.sin(time_args), torch.cos(time_args)), dim=-1)
+        return time_embeddings
+
+class ResidualBlockWithTime(nn.Module):
+    """
+    A standard residual block used in UNets for diffusion models.
+    Includes Group Normalization, SiLU activation, Conv layers, and time embedding injection.
+    """
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, num_groups: int = 32):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # First convolution path
+        self.norm1 = nn.GroupNorm(num_groups, in_channels)
+        self.act1 = nn.SiLU() # Swish activation - common in modern networks
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+
+        # Time embedding projection
+        # A small MLP to project the time embedding to the output channel dimension
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_channels)
+        )
+
+        # Second convolution path
+        self.norm2 = nn.GroupNorm(num_groups, out_channels)
+        self.act2 = nn.SiLU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        # Residual connection: Adjust channels if needed using a 1x1 convolution
+        if in_channels != out_channels:
+            self.residual_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual_connection = nn.Identity() # No change needed if channels match
+
+    def forward(self, input_features: torch.Tensor, time_embedding_vector: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input_features (torch.Tensor): Input feature map (batch, in_c, H, W).
+            time_embedding_vector (torch.Tensor): Time embedding (batch, time_emb_dim).
+        Returns:
+            torch.Tensor: Output feature map (batch, out_c, H, W).
+        """
+        residual = input_features # Save for skip connection
+
+        # First block
+        hidden_state = self.norm1(input_features)
+        hidden_state = self.act1(hidden_state)
+        hidden_state = self.conv1(hidden_state)
+
+        # Add time embedding
+        time_proj = self.time_mlp(time_embedding_vector)
+        # Reshape time_proj to (batch, out_channels, 1, 1) to allow broadcasting
+        time_proj = time_proj[:, :, None, None]
+        hidden_state = hidden_state + time_proj
+
+        # Second block
+        hidden_state = self.norm2(hidden_state)
+        hidden_state = self.act2(hidden_state)
+        hidden_state = self.conv2(hidden_state)
+
+        # Apply residual connection
+        output = hidden_state + self.residual_connection(residual)
+        return output
+
+class AttentionBlock(nn.Module):
+    """
+    An attention block that can perform self-attention or cross-attention.
+    Crucial for incorporating text conditioning (cross-attention).
+    """
+    def __init__(self, query_dim: int, context_dim: int = None, num_heads: int = 8, head_dim: int = 64, num_groups: int = 32):
+        super().__init__()
+        inner_dim = head_dim * num_heads
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5 # Scaling factor for dot product attention
+
+        self.norm = nn.GroupNorm(num_groups, query_dim)
+
+        # Define query, key, and value projections
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+
+        # Key and Value projections depend on whether it's cross-attention or self-attention
+        context_dim = context_dim if context_dim is not None else query_dim
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        # Output projection
+        self.to_out = nn.Linear(inner_dim, query_dim)
+
+    def forward(self, query_features: torch.Tensor, context_features: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            query_features (torch.Tensor): Input features (batch, channels, H, W). These are the queries.
+            context_features (torch.Tensor, optional): Context features for cross-attention
+                                                     (e.g., text embeddings). Shape (batch, seq_len, context_dim).
+                                                     If None, performs self-attention.
+        Returns:
+            torch.Tensor: Output features after attention (batch, channels, H, W).
+        """
+        residual = query_features
+        batch_size, channels, height, width = query_features.shape
+
+        # Normalize and prepare input features
+        norm_features = self.norm(query_features)
+        # Reshape for attention: (batch, channels, H*W) -> (batch, H*W, channels)
+        query_seq = norm_features.view(batch_size, channels, -1).permute(0, 2, 1)
+
+        # --- Calculate Q, K, V ---
+        query = self.to_q(query_seq)
+
+        # Determine Key and Value based on context
+        if context_features is None:
+            # Self-attention: K and V come from the input features themselves
+            context_seq = query_seq
+        else:
+            # Cross-attention: K and V come from the context features
+            # Context shape is often (batch, seq_len, context_dim), already suitable
+            context_seq = context_features
+
+        key = self.to_k(context_seq)
+        value = self.to_v(context_seq)
+
+        # --- Perform Scaled Dot-Product Attention ---
+        # Reshape Q, K, V for multi-head attention
+        # (batch, num_tokens, num_heads * head_dim) -> (batch * num_heads, num_tokens, head_dim)
+        query = query.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3).reshape(-1, query_seq.shape[1], self.head_dim)
+        key = key.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3).reshape(-1, context_seq.shape[1], self.head_dim)
+        value = value.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3).reshape(-1, context_seq.shape[1], self.head_dim)
+
+        # Calculate attention scores (Q @ K.T / scale)
+        # Result shape: (batch * num_heads, num_query_tokens, num_key_tokens)
+        attention_scores = torch.bmm(query, key.transpose(-1, -2)) * self.scale
+        attention_probs = F.softmax(attention_scores, dim=-1)
+
+        # Apply attention weights to values (Attention_Probs @ V)
+        # Result shape: (batch * num_heads, num_query_tokens, head_dim)
+        attention_output = torch.bmm(attention_probs, value)
+
+        # Reshape back to (batch, num_query_tokens, num_heads * head_dim)
+        attention_output = attention_output.view(batch_size, self.num_heads, query_seq.shape[1], self.head_dim).permute(0, 2, 1, 3).reshape(batch_size, query_seq.shape[1], -1)
+
+        # --- Project output and add residual ---
+        attention_output = self.to_out(attention_output)
+
+        # Reshape back to image format: (batch, H*W, channels) -> (batch, channels, H, W)
+        attention_output = attention_output.permute(0, 2, 1).view(batch_size, channels, height, width)
+
+        # Add the residual connection
+        output = attention_output + residual
+        return output
+
+
+# --- Core Models: UNet Structure (Inside core_models/noise_predictor_unet.py) ---
+
+class DownBlock(nn.Module):
+    """A block in the UNet encoder path, containing ResNet blocks, optional Attention, and Downsampling."""
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, num_layers: int, use_attention: bool, head_dim: int):
+        super().__init__()
+        self.resnets = nn.ModuleList()
+        self.attentions = nn.ModuleList()
+        self.use_attention = use_attention
+
+        # Add residual/attention blocks
+        for i in range(num_layers):
+            res_in_channels = in_channels if i == 0 else out_channels
+            self.resnets.append(ResidualBlockWithTime(res_in_channels, out_channels, time_emb_dim))
+            if use_attention:
+                self.attentions.append(AttentionBlock(out_channels, context_dim=config.text_embedding_dim, head_dim=head_dim)) # Added context_dim
+            else:
+                 self.attentions.append(nn.Identity()) # Placeholder if no attention
+
+        # Downsampling layer (optional, usually added after the block)
+        self.downsampler = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, hidden_state: torch.Tensor, time_embedding: torch.Tensor, context: torch.Tensor = None):
+        output_states = [] # To store outputs for skip connections
+        for resnet, attention in zip(self.resnets, self.attentions):
+            hidden_state = resnet(hidden_state, time_embedding)
+            # Pass context only if attention is used and context is provided
+            attn_context = context if self.use_attention and context is not None else None
+            hidden_state = attention(hidden_state, context_features=attn_context)
+            output_states.append(hidden_state)
+
+        # Apply downsampling
+        downsampled_state = self.downsampler(hidden_state)
+        return downsampled_state, output_states # Return downsampled state and skip connections
+
+
+class UpBlock(nn.Module):
+    """A block in the UNet decoder path, containing ResNet blocks, optional Attention, and Upsampling."""
+    def __init__(self, in_channels: int, prev_out_channels: int, out_channels: int, time_emb_dim: int, num_layers: int, use_attention: bool, head_dim: int):
+        super().__init__()
+        self.resnets = nn.ModuleList()
+        self.attentions = nn.ModuleList()
+        self.use_attention = use_attention
+
+        # Calculate input channels for each resnet layer, considering skip connections
+        res_in_channels = [in_channels + prev_out_channels] + [out_channels + prev_out_channels] * (num_layers -1)
+        res_out_channels = [out_channels] * num_layers
+
+        # Add residual/attention blocks
+        for i in range(num_layers):
+            self.resnets.append(ResidualBlockWithTime(res_in_channels[i], res_out_channels[i], time_emb_dim))
+            if use_attention:
+                self.attentions.append(AttentionBlock(out_channels, context_dim=config.text_embedding_dim, head_dim=head_dim)) # Added context_dim
+            else:
+                self.attentions.append(nn.Identity()) # Placeholder
+
+        # Upsampling layer (applied before the block usually)
+        self.upsampler = nn.Upsample(scale_factor=2, mode="nearest")
+        # Convolution after upsampling to adjust channels
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+
+
+    def forward(self, hidden_state: torch.Tensor, skip_states: list[torch.Tensor], time_embedding: torch.Tensor, context: torch.Tensor = None):
+        # Upsample first
+        hidden_state = self.upsampler(hidden_state)
+        hidden_state = self.conv(hidden_state)
+
+        # Concatenate with skip connections and process through layers
+        for resnet, attention in zip(self.resnets, self.attentions):
+             # Get the corresponding skip state (usually the last one from the down block list)
+            skip_hidden_state = skip_states.pop()
+            # Concatenate along the channel dimension
+            hidden_state = torch.cat([hidden_state, skip_hidden_state], dim=1)
+            hidden_state = resnet(hidden_state, time_embedding)
+            # Pass context only if attention is used and context is provided
+            attn_context = context if self.use_attention and context is not None else None
+            hidden_state = attention(hidden_state, context_features=attn_context)
+
+        return hidden_state
+
+
+class MidBlock(nn.Module):
+    """The middle block of the UNet, often containing ResNet and Attention layers."""
+    def __init__(self, mid_channels: int, time_emb_dim: int, head_dim: int):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            ResidualBlockWithTime(mid_channels, mid_channels, time_emb_dim),
+            ResidualBlockWithTime(mid_channels, mid_channels, time_emb_dim)
+        ])
+        self.attentions = nn.ModuleList([
+            AttentionBlock(mid_channels, context_dim=config.text_embedding_dim, head_dim=head_dim), # Added context_dim
+        ])
+
+    def forward(self, hidden_state: torch.Tensor, time_embedding: torch.Tensor, context: torch.Tensor = None):
+        hidden_state = self.resnets[0](hidden_state, time_embedding)
+        # Pass context only if attention is used and context is provided
+        attn_context = context if context is not None else None
+        hidden_state = self.attentions[0](hidden_state, context_features=attn_context)
+        hidden_state = self.resnets[1](hidden_state, time_embedding)
+        return hidden_state
+
+
+class NoisePredictorUNet(nn.Module):
+    """
+    The core UNet model that predicts noise added to latents.
+    Combines DownBlocks, MidBlock, and UpBlocks with time and text conditioning.
+    """
+    def __init__(
+        self,
+        in_channels: int = config.latent_channels, # Usually 4 for SD VAE latents
+        out_channels: int = config.latent_channels,
+        block_out_channels: tuple = config.unet_block_out_channels,
+        layers_per_block: int = config.unet_layers_per_block,
+        time_embedding_dim: int = config.unet_time_embedding_dim,
+        text_context_embedding_dim: int = config.text_embedding_dim,
+        attention_head_dim: int = config.unet_attention_head_dim,
+    ):
+        super().__init__()
+
+        # --- Time Embedding Projection ---
+        self.time_embedding = SinusoidalTimeEmbedding(time_embedding_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embedding_dim, time_embedding_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_embedding_dim * 4, time_embedding_dim)
+        )
+
+        # --- Input Convolution ---
+        # Project input latents to the first block's channel size
+        self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=1)
+
+        # --- Downsampling Path (Encoder) ---
+        self.down_blocks = nn.ModuleList()
+        current_channels = block_out_channels[0]
+        input_block_channels = [current_channels] # Track input channels for up-blocks
+        output_block_channels = [] # Track output channels from down-blocks for skip connections
+
+        for i, channels in enumerate(block_out_channels):
+            is_last_block = i == len(block_out_channels) - 1
+            # Determine if attention should be used (often in lower-resolution blocks)
+            use_attention = channels > 128 # Example threshold, adjust as needed
+
+            down_block = DownBlock(
+                in_channels=current_channels,
+                out_channels=channels,
+                time_emb_dim=time_embedding_dim,
+                num_layers=layers_per_block,
+                use_attention=use_attention,
+                head_dim=attention_head_dim,
+            )
+            self.down_blocks.append(down_block)
+            current_channels = channels
+            input_block_channels.append(current_channels) # Store for up block reference
+            output_block_channels.append(current_channels) # Store output channels
+
+
+        # --- Middle Block ---
+        self.mid_block = MidBlock(
+            mid_channels=block_out_channels[-1],
+            time_emb_dim=time_embedding_dim,
+            head_dim=attention_head_dim,
+        )
+
+        # --- Upsampling Path (Decoder) ---
+        self.up_blocks = nn.ModuleList()
+        # Reverse the block channels for the up path
+        reversed_block_out_channels = list(reversed(block_out_channels))
+        # Input channels for UpBlocks come from the output of the previous UpBlock
+        # and the skip connections from the corresponding DownBlock.
+        current_channels = reversed_block_out_channels[0] # Start with channels from mid block output
+        for i, channels in enumerate(reversed_block_out_channels):
+            is_last_block = i == len(reversed_block_out_channels) - 1
+            use_attention = channels > 128 # Example threshold
+
+            # Get the channel size of the skip connection from the corresponding down block
+            # Need careful indexing here
+            prev_output_channel = input_block_channels[-(i+2)] # Get corresponding input channel size from down path
+
+
+            up_block = UpBlock(
+                in_channels=current_channels, # Channels from previous up-block or mid-block
+                prev_out_channels=prev_output_channel, # Channels from skip connection
+                out_channels=channels, # Target output channels for this block
+                time_emb_dim=time_embedding_dim,
+                num_layers=layers_per_block + 1, # Often have an extra layer in up-blocks
+                use_attention=use_attention,
+                head_dim=attention_head_dim,
+            )
+            self.up_blocks.append(up_block)
+            current_channels = channels # Output channels of this block become input for next
+
+
+        # --- Output Projection ---
+        self.norm_out = nn.GroupNorm(32, block_out_channels[0]) # Normalize final features
+        self.act_out = nn.SiLU()
+        self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
+
+    def forward(self, noisy_latents: torch.Tensor, timesteps: torch.Tensor, text_conditioning_embedding: torch.Tensor):
+        """
+        Args:
+            noisy_latents (torch.Tensor): Input noisy latents (batch, latent_c, H/sf, W/sf).
+            timesteps (torch.Tensor): Batch of timesteps (batch,).
+            text_conditioning_embedding (torch.Tensor): Text embeddings (batch, seq_len, text_emb_dim).
+        Returns:
+            torch.Tensor: Predicted noise (same shape as noisy_latents).
+        """
+        # 1. Time Embedding
+        time_emb = self.time_embedding(timesteps)
+        time_emb = self.time_mlp(time_emb)
+
+        # 2. Initial Convolution
+        hidden_state = self.conv_in(noisy_latents)
+        skip_connections = [hidden_state] # Store the first feature map
+
+        # 3. Downsampling Path
+        for i, down_block in enumerate(self.down_blocks):
+            hidden_state, block_skips = down_block(hidden_state, time_emb, text_conditioning_embedding)
+            skip_connections.extend(block_skips) # Add outputs from this block
+
+        # 4. Middle Block
+        hidden_state = self.mid_block(hidden_state, time_emb, text_conditioning_embedding)
+
+        # 5. Upsampling Path
+        for i, up_block in enumerate(self.up_blocks):
+            # Get the right number of skip connections for this block
+            # Each up-block consumes (num_layers + 1) skip connections
+             num_skips_needed = config.unet_layers_per_block + 1
+             skips_for_block = skip_connections[-num_skips_needed:]
+             skip_connections = skip_connections[:-num_skips_needed] # Remove used skips
+             hidden_state = up_block(hidden_state, skips_for_block, time_emb, text_conditioning_embedding)
+
+
+        # 6. Output Projection
+        output = self.norm_out(hidden_state)
+        output = self.act_out(output)
+        predicted_noise = self.conv_out(output)
+
+        return predicted_noise
+
+
+# --- Sampling: Diffusion Scheduler (Simulates sampling/diffusion_scheduler.py) ---
+
+class DiffusionScheduler:
+    """
+    Manages the noise schedule (betas, alphas) and provides methods
+    for adding noise (forward process) and calculating sampling steps (reverse process).
+    """
+    def __init__(
+        self,
+        num_train_timesteps: int = config.num_diffusion_timesteps,
+        beta_start: float = config.beta_start,
+        beta_end: float = config.beta_end,
+        beta_schedule: str = config.beta_schedule,
+        device: str = config.device,
+    ):
+        self.num_train_timesteps = num_train_timesteps
+        self.device = device
+
+        # Define the beta schedule (variance schedule)
+        if beta_schedule == "linear":
+            self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32, device=device)
+        elif beta_schedule == "cosine":
+            # Cosine schedule (more gradual near the end) - often works well
+            steps = num_train_timesteps + 1
+            x = torch.linspace(0, num_train_timesteps, steps, dtype=torch.float32, device=device)
+            alphas_cumprod = torch.cos(((x / num_train_timesteps) + 0.008) / 1.008 * torch.pi / 2) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1. - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            self.betas = torch.clip(betas, 0., 0.999) # Ensure stability
+        else:
+            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
+
+        # Pre-calculate alphas and cumulative products for efficiency
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+
+        # Values needed for the forward process (adding noise)
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+
+        # Values needed for the DDIM sampling steps (reverse process)
+        # alpha_{t-1} / alpha_t
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0) # Add alpha_cumprod_0 = 1.0
+        self.variance = (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod) * self.betas
+        self.log_variance = torch.log(torch.clamp(self.variance, min=1e-20)) # Clamp for numerical stability
+
+        # Timesteps for inference (will be set later by set_inference_timesteps)
+        self.num_inference_steps = None
+        self.timesteps = None
+        self.final_alpha_cumprod = torch.tensor(1.0, device=device) # Used for step t=0
+
+    def _get_variance(self, timestep, prev_timestep):
+        """Helper to get variance between two timesteps."""
+        alpha_prod_t = self.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        # Simplified variance calculation for DDIM (eta=0) - effectively zero noise added
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        return variance
+
+
+    def set_inference_timesteps(self, num_inference_steps: int, device=None):
+        """
+        Sets the discrete timesteps to use during inference.
+        Args:
+            num_inference_steps (int): The number of denoising steps.
+            device: The device to put the timesteps tensor on.
+        """
+        self.num_inference_steps = num_inference_steps
+        device = device or self.device
+
+        # Create a linear spacing of timesteps from T-1 down to 0
+        step_ratio = self.num_train_timesteps // self.num_inference_steps
+        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        self.timesteps = torch.from_numpy(timesteps).to(device)
+
+    def add_noise(self, original_samples: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """
+        Adds noise to clean samples according to the forward diffusion process.
+        Args:
+            original_samples (torch.Tensor): The clean input data (e.g., latents z0).
+            timesteps (torch.Tensor): The timesteps 't' for which to add noise (batch size).
+        Returns:
+            torch.Tensor: The noisy samples z_t.
+        """
+        # Get sqrt(alpha_cumprod) for the given timesteps
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[timesteps].to(original_samples.device)
+        # Reshape to allow broadcasting: (batch,) -> (batch, 1, 1, 1) for images/latents
+        sqrt_alphas_cumprod_t = sqrt_alphas_cumprod_t.view(-1, 1, 1, 1)
+
+        # Get sqrt(1 - alpha_cumprod) for the given timesteps
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[timesteps].to(original_samples.device)
+        sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod_t.view(-1, 1, 1, 1)
+
+        # Sample random noise (epsilon) from standard normal distribution
+        noise = torch.randn_like(original_samples, device=original_samples.device)
+
+        # Calculate noisy sample: z_t = sqrt(alpha_cumprod_t) * z_0 + sqrt(1 - alpha_cumprod_t) * epsilon
+        noisy_samples = sqrt_alphas_cumprod_t * original_samples + sqrt_one_minus_alphas_cumprod_t * noise
+        return noisy_samples
+
+    def step(self, model_output: torch.Tensor, timestep: int, sample: torch.Tensor, eta: float = 0.0):
+        """
+        Performs one DDIM reverse step. Predicts the previous sample (x_{t-1}) from the current sample (x_t)
+        and the predicted noise (model_output).
+
+        Args:
+            model_output (torch.Tensor): The noise predicted by the UNet model (epsilon_theta).
+            timestep (int): The current timestep 't'.
+            sample (torch.Tensor): The current noisy sample x_t.
+            eta (float): Controls the stochasticity (0.0 for deterministic DDIM).
+
+        Returns:
+            dict: A dictionary containing the 'prev_sample'.
+        """
+        if self.timesteps is None:
+            raise ValueError("Scheduler timesteps not set. Call `set_inference_timesteps` first.")
+
+        # Find the index of the current timestep
+        timestep_index = (self.timesteps == timestep).nonzero(as_tuple=True)[0].item()
+
+        # Determine the previous timestep
+        prev_timestep_index = timestep_index + 1
+        if prev_timestep_index < len(self.timesteps):
+            prev_timestep = self.timesteps[prev_timestep_index].item()
+        else:
+            prev_timestep = -1 # Signifies the final step to t=0
+
+        # Get alpha cumulative products for t and t-1
+        alpha_prod_t = self.alphas_cumprod[timestep].to(sample.device)
+        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep].to(sample.device) if prev_timestep >= 0 else self.final_alpha_cumprod.to(sample.device)
+
+        # --- DDIM Calculation ---
+        # 1. Predict the original sample (x_0)
+        # x_0_pred = (x_t - sqrt(1 - alpha_t) * epsilon_theta) / sqrt(alpha_t)
+        beta_prod_t = 1 - alpha_prod_t
+        pred_original_sample = (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt()
+
+        # 2. Calculate coefficients for the previous sample prediction
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        coeff_original_sample = alpha_prod_t_prev.sqrt()
+        coeff_noise_direction = beta_prod_t_prev.sqrt()
+
+        # 3. Compute the previous sample mean (deterministic part)
+        # x_{t-1}_mean = sqrt(alpha_{t-1}) * x_0_pred + sqrt(1 - alpha_{t-1}) * epsilon_theta
+        prev_sample_mean = coeff_original_sample * pred_original_sample + coeff_noise_direction * model_output
+
+        # 4. Add stochastic noise (if eta > 0) - For standard DDIM, eta=0
+        if eta > 0:
+            # Calculate variance and add random noise scaled by eta * sqrt(variance)
+            variance = self._get_variance(timestep, prev_timestep) * eta**2
+            noise = torch.randn_like(model_output)
+            prev_sample = prev_sample_mean + variance.sqrt() * noise
+        else:
+            # Deterministic step (eta=0)
+            prev_sample = prev_sample_mean
+
+        return {"prev_sample": prev_sample}
+
+
+# --- Sampling: DDIM Sampler (Simulates sampling/ddim_sampler.py) ---
+
+class DDIMSampler:
+    """
+    Implements the DDIM sampling loop using a trained UNet model and a scheduler.
+    """
+    def __init__(self, unet_model: NoisePredictorUNet, scheduler: DiffusionScheduler, config: TrainingConfig):
+        self.model = unet_model
+        self.scheduler = scheduler
+        self.config = config
+        self.device = config.device
+        self.model.eval() # Set model to evaluation mode
+
+    @torch.no_grad() # Disable gradients during inference
+    def sample(self,
+               text_embeddings: torch.Tensor,
+               unconditional_embeddings: torch.Tensor,
+               batch_size: int,
+               shape: tuple, # (channels, height, width) of latent
+               guidance_scale: float = config.guidance_scale,
+               num_inference_steps: int = config.num_inference_steps,
+               initial_noise: torch.Tensor = None
+               ) -> torch.Tensor:
+        """
+        Generates latent samples using the DDIM loop.
+
+        Args:
+            text_embeddings (torch.Tensor): Conditional text embeddings (batch, seq_len, embed_dim).
+            unconditional_embeddings (torch.Tensor): Unconditional text embeddings (batch, seq_len, embed_dim).
+            batch_size (int): Number of samples to generate.
+            shape (tuple): Shape of the latent space (C, H, W).
+            guidance_scale (float): Scale for Classifier-Free Guidance.
+            num_inference_steps (int): Number of DDIM steps.
+            initial_noise (torch.Tensor, optional): Starting noise tensor. If None, generates random noise.
+
+        Returns:
+            torch.Tensor: The generated latent samples (batch, C, H, W).
+        """
+        # 1. Set inference timesteps in the scheduler
+        self.scheduler.set_inference_timesteps(num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        # 2. Prepare initial latent tensor (random noise)
+        if initial_noise is None:
+            latent_shape = (batch_size,) + shape # Add batch dimension
+            latents = torch.randn(latent_shape, device=self.device, dtype=text_embeddings.dtype) # Match dtype
+        else:
+            latents = initial_noise.to(self.device)
+
+        # Scale initial noise by scheduler's overall variance (sometimes done)
+        # latents = latents * self.scheduler.init_noise_sigma # Depends on scheduler implementation details
+
+        # 3. DDIM Sampling Loop
+        for t in tqdm(timesteps, desc="DDIM Sampling"):
+            # --- Classifier-Free Guidance ---
+            # Duplicate latents for conditional and unconditional passes
+            latent_model_input = torch.cat([latents] * 2) # Shape becomes (2 * batch_size, C, H, W)
+            # We also need duplicated timesteps and combined embeddings
+            timestep_input = torch.tensor([t] * latent_model_input.shape[0], device=self.device)
+            conditioning_input = torch.cat([unconditional_embeddings, text_embeddings])
+
+            # Predict noise for both conditional and unconditional inputs
+            noise_pred_uncond, noise_pred_cond = self.model(
+                latent_model_input,
+                timestep_input,
+                conditioning_input
+            ).chunk(2) # Split the result back into two parts
+
+            # Combine predictions using CFG formula:
+            # noise = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+            # --- Scheduler Step ---
+            # Use the scheduler to compute the previous latent state
+            scheduler_output = self.scheduler.step(noise_pred, t.item(), latents) # Pass t as scalar int
+            latents = scheduler_output["prev_sample"] # Get the denoised latent for the previous step
+
+        # 4. Return the final denoised latents
+        return latents
+
+
+# --- Training: Dataset Handler (Simulates training/dataset_handler.py) ---
+
+class SimpleImageDataset(torch.utils.data.Dataset):
+    """
+    A very basic placeholder dataset.
+    In reality, you'd load images and captions from files here.
+    """
+    def __init__(self, num_samples=1000, image_size=config.image_size, transform=None):
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.transform = transform
+        # Placeholder captions - replace with real ones!
+        self.captions = [f"A sample image {i}" for i in range(num_samples)]
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # Generate a dummy image (e.g., random noise)
+        # In reality: Load image from self.file_list[idx]
+        dummy_image = torch.randn(3, self.image_size, self.image_size)
+        # Normalize image tensor (example, adjust based on VAE expectations)
+        dummy_image = (dummy_image - 0.5) * 2.0 # Map roughly to [-1, 1]
+
+        # Get caption
+        caption = self.captions[idx]
+
+        # Apply transformations if provided (like resizing, normalization)
+        if self.transform:
+            dummy_image = self.transform(dummy_image) # Note: transform usually applied to PIL images
+
+        return {"pixel_values": dummy_image, "caption": caption}
+
+def get_dataloader(batch_size=config.train_batch_size):
+    """Creates a DataLoader for the dummy dataset."""
+    # Define basic transformations (more sophisticated needed for real images)
+    # from torchvision import transforms
+    # transform = transforms.Compose([
+    #     transforms.ToTensor(), # Converts PIL image to tensor
+    #     transforms.Normalize([0.5], [0.5]), # Example normalization
+    # ])
+    dataset = SimpleImageDataset(image_size=config.image_size) # transform=transform)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0 # Adjust based on your system
+    )
+    return dataloader
+
+
+# --- Training: Loss Function (Simulates training/loss_functions.py) ---
+
+def calculate_diffusion_loss(
+    clean_latents: torch.Tensor, # z0 from VAE encoder
+    noise_predictor: NoisePredictorUNet,
+    scheduler: DiffusionScheduler,
+    text_embeddings: torch.Tensor,
+    unconditional_embeddings: torch.Tensor, # For CFG training dropout
+    guidance_dropout_prob: float = 0.1 # Probability of dropping text condition
+    ):
+    """
+    Calculates the diffusion model training loss (usually MSE between added noise and predicted noise).
+
+    Args:
+        clean_latents (torch.Tensor): Latent representations of clean images (batch, C, H, W).
+        noise_predictor (NoisePredictorUNet): The UNet model being trained.
+        scheduler (DiffusionScheduler): The diffusion scheduler.
+        text_embeddings (torch.Tensor): Conditional text embeddings.
+        unconditional_embeddings (torch.Tensor): Unconditional embeddings.
+        guidance_dropout_prob (float): Probability of using unconditional embeddings during training.
+
+    Returns:
+        torch.Tensor: The calculated loss scalar.
+    """
+    # 1. Sample random timesteps for each latent in the batch
+    batch_size = clean_latents.shape[0]
+    timesteps = torch.randint(0, scheduler.num_train_timesteps, (batch_size,), device=clean_latents.device).long()
+
+    # 2. Sample random noise (epsilon) - the target for the UNet
+    noise = torch.randn_like(clean_latents)
+
+    # 3. Create noisy latents (z_t) using the forward process
+    noisy_latents = scheduler.add_noise(clean_latents, timesteps)
+
+    # 4. Classifier-Free Guidance Training: Randomly drop text conditioning
+    final_text_embeddings = text_embeddings
+    # Create a mask for dropping guidance
+    guidance_mask = torch.rand(batch_size, device=clean_latents.device) > guidance_dropout_prob
+    # Reshape mask for broadcasting: (batch_size,) -> (batch_size, 1, 1)
+    guidance_mask = guidance_mask.view(batch_size, 1, 1)
+    # Select between conditional and unconditional embeddings based on the mask
+    final_text_embeddings = torch.where(guidance_mask, text_embeddings, unconditional_embeddings)
+
+    # 5. Predict the noise using the UNet
+    predicted_noise = noise_predictor(noisy_latents, timesteps, final_text_embeddings)
+
+    # 6. Calculate the loss (Mean Squared Error is common)
+    # Compare the added noise (our target) with the UNet's prediction
+    loss = F.mse_loss(predicted_noise, noise) # MSE(prediction, target)
+
+    return loss
+
+
+# --- Evaluation: Visualization (Simulates evaluation/visualization.py) ---
+
+def convert_latents_to_images(latents: torch.Tensor, vae: VariationalAutoencoderWrapper) -> list:
+    """Decodes latents and converts them to PIL Images."""
+    # Decode latents to pixel space [-1, 1]
+    images = vae.decode(latents)
+    # Denormalize: map from [-1, 1] to [0, 255] and convert to PIL
+    images = (images / 2 + 0.5).clamp(0, 1) # Map to [0, 1]
+    images = images.cpu().permute(0, 2, 3, 1).numpy() # (B, H, W, C)
+    images = (images * 255).round().astype("uint8")
+    pil_images = [Image.fromarray(image) for image in images]
+    return pil_images
+
+def save_sample_grid(pil_images: list, grid_size: tuple, save_path: str):
+    """Saves a list of PIL images as a grid."""
+    if not pil_images:
+        return
+    num_images = len(pil_images)
+    rows, cols = grid_size
+    if num_images < rows * cols:
+        print(f"Warning: Not enough images ({num_images}) for grid size {grid_size}. Adjusting grid.")
+        # Adjust grid size or handle appropriately
+        cols = math.ceil(num_images / rows) if rows > 0 else num_images
+        if cols == 0: cols = 1
+        rows = math.ceil(num_images / cols) if cols > 0 else num_images
+        if rows == 0: rows = 1
+
+
+    img_width, img_height = pil_images[0].size
+    grid_img = Image.new('RGB', (cols * img_width, rows * img_height))
+
+    for i, img in enumerate(pil_images):
+        if i >= rows * cols: break # Prevent index error if adjustment failed
+        row_idx = i // cols
+        col_idx = i % cols
+        grid_img.paste(img, (col_idx * img_width, row_idx * img_height))
+
+    grid_img.save(save_path)
+    print(f"Sample grid saved to {save_path}")
+
+# --- Inference Function (Simulates inference/generate_samples.py) ---
+
+def generate_samples(
+    prompts: list[str],
+    vae: VariationalAutoencoderWrapper,
+    text_encoder: TextEncoderInterface,
+    unet: NoisePredictorUNet,
+    scheduler: DiffusionScheduler,
+    config: TrainingConfig,
+    output_filename: str = "generated_sample.png"
+    ):
+    """Generates images from text prompts and saves them."""
+    print(f"Generating images for prompts: {prompts}")
+    batch_size = len(prompts)
+    device = config.device
+
+    # Prepare models
+    vae.to(device).eval()
+    text_encoder.to(device).eval()
+    unet.to(device).eval()
+
+    # Get conditional text embeddings
+    conditional_embeddings = text_encoder(prompts)
+
+    # Get unconditional text embeddings
+    unconditional_embeddings = text_encoder.get_unconditional_embedding(batch_size)
+
+    # Define latent shape
+    latent_height = config.image_size // config.latent_dim_scale_factor
+    latent_width = config.image_size // config.latent_dim_scale_factor
+    latent_shape = (config.latent_channels, latent_height, latent_width)
+
+    # Initialize sampler
+    sampler = DDIMSampler(unet, scheduler, config)
+
+    # Generate latents
+    generated_latents = sampler.sample(
+        text_embeddings=conditional_embeddings,
+        unconditional_embeddings=unconditional_embeddings,
+        batch_size=batch_size,
+        shape=latent_shape,
+        guidance_scale=config.guidance_scale,
+        num_inference_steps=config.num_inference_steps
+    )
+
+    # Decode latents to images
+    pil_images = convert_latents_to_images(generated_latents, vae)
+
+    # Save images (e.g., as a grid)
+    grid_cols = int(math.sqrt(batch_size))
+    grid_rows = math.ceil(batch_size / grid_cols)
+    save_path = os.path.join(config.output_dir, output_filename)
+    save_sample_grid(pil_images, grid_size=(grid_rows, grid_cols), save_path=save_path)
+
+    return pil_images
+
+# --- Training Loop (Simulates training/training_loop.py) ---
+
+def train_model(config: TrainingConfig):
+    """The main training loop."""
+    print("Starting training process...")
+    print(f"Device: {config.device}")
+
+    # --- Setup WandB (Commented Out) ---
+    # wandb_run = None
+    # config_dict = {k: v for k, v in config.__dict__.items() if not k.startswith('__')}
+    # if config.use_wandb:
+    #     # --- WandB Sweep Integration Example (Commented Out) ---
+    #     # If running a sweep agent, wandb.init() might be called automatically
+    #     # with hyperparameters from the sweep.
+    #     # You might need to update the 'config' object with sweep params here.
+    #     # Example:
+    #     # wandb.init()
+    #     # if wandb.config:
+    #     #     config.learning_rate = wandb.config.learning_rate
+    #     #     config.train_batch_size = wandb.config.train_batch_size
+    #     #     config.guidance_scale = wandb.config.guidance_scale
+    #     #     # Update other relevant config fields...
+    #     # config_dict = wandb.config # Log the sweep config instead
+    #     wandb_run = setup_wandb(config_dict)
+
+    # --- Initialize Models ---
+    print("Loading models...")
+    vae = VariationalAutoencoderWrapper(config.pretrained_vae_name_or_path, config.device)
+    text_encoder = TextEncoderInterface(config.pretrained_clip_name_or_path, config.device)
+    unet = NoisePredictorUNet() # Using defaults from config
+    unet.to(config.device)
+
+    # --- Initialize Scheduler and Optimizer ---
+    scheduler = DiffusionScheduler(device=config.device) # Uses defaults from config
+    optimizer = torch.optim.AdamW(
+        unet.parameters(), # Only optimize the UNet parameters
+        lr=config.learning_rate,
+        betas=(config.adam_beta1, config.adam_beta2),
+        weight_decay=config.adam_weight_decay,
+        eps=config.adam_epsilon,
+    )
+
+    # --- Initialize DataLoader ---
+    print("Setting up DataLoader...")
+    dataloader = get_dataloader(batch_size=config.train_batch_size)
+
+    # --- Automatic Mixed Precision (Optional) ---
+    scaler = None
+    if config.mixed_precision == "fp16":
+        scaler = torch.cuda.amp.GradScaler()
+        print("Using Automatic Mixed Precision (fp16)")
+
+    # --- Load Checkpoint (Optional) ---
+    start_epoch = 0
+    global_step = 0
+    # checkpoint_path = os.path.join(config.output_dir, "latest_checkpoint.pth")
+    # if os.path.exists(checkpoint_path):
+    #    start_epoch, global_step = load_checkpoint(unet, optimizer, None, checkpoint_path, config.device) # Assuming scheduler state isn't critical to save/load
+
+    # --- Training Loop ---
+    print("Starting training loop...")
+    unet.train() # Set UNet to training mode
+
+    for epoch in range(start_epoch, config.num_epochs):
+        print(f"\n--- Epoch {epoch+1}/{config.num_epochs} ---")
+        epoch_loss = 0.0
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1} Loss: N/A")
+
+        for step, batch in enumerate(progress_bar):
+            optimizer.zero_grad() # Clear gradients for this step
+
+            # --- Data Preparation ---
+            images = batch["pixel_values"].to(config.device)
+            captions = batch["caption"] # List of strings
+
+            # 1. Encode images to latents using VAE (no gradients needed)
+            with torch.no_grad():
+                 clean_latents = vae.encode(images)
+
+            # 2. Encode text prompts to embeddings (no gradients needed)
+            with torch.no_grad():
+                text_embeddings = text_encoder(captions)
+                unconditional_embeddings = text_encoder.get_unconditional_embedding(images.shape[0])
+
+            # --- Loss Calculation (with Mixed Precision if enabled) ---
+            if scaler:
+                with torch.cuda.amp.autocast(): # Context manager for AMP
+                    loss = calculate_diffusion_loss(
+                        clean_latents, unet, scheduler, text_embeddings, unconditional_embeddings
+                    )
+                # Scale loss and perform backward pass
+                scaler.scale(loss).backward()
+                scaler.step(optimizer) # Unscales gradients and calls optimizer.step()
+                scaler.update() # Updates the scale for next iteration
+            else:
+                # Standard precision training
+                loss = calculate_diffusion_loss(
+                    clean_latents, unet, scheduler, text_embeddings, unconditional_embeddings
+                )
+                loss.backward()
+                optimizer.step()
+
+            current_loss = loss.item()
+            epoch_loss += current_loss
+            global_step += 1
+
+            # Update progress bar description
+            progress_bar.set_description(f"Epoch {epoch+1} Loss: {current_loss:.4f}")
+
+            # --- Logging ---
+            if global_step % config.log_frequency == 0:
+                avg_loss = epoch_loss / (step + 1)
+                print(f"Step: {global_step}, Avg Epoch Loss: {avg_loss:.4f}, Current Loss: {current_loss:.4f}")
+                # --- Log to WandB (Commented Out) ---
+                # log_metrics = {"train/loss": current_loss, "epoch": epoch + (step / len(dataloader))}
+                # log_to_wandb(log_metrics, step=global_step)
+
+            # --- Save Sample Images ---
+            if global_step % config.save_image_frequency == 0:
+                print("Generating sample images...")
+                unet.eval() # Switch to eval mode for generation
+                sample_prompts = ["A photo of a cat", "An abstract painting"] # Example prompts
+                if len(sample_prompts) > config.train_batch_size: # Ensure batch size matches
+                    sample_prompts = sample_prompts[:config.train_batch_size]
+
+                generated_images = generate_samples(
+                    sample_prompts, vae, text_encoder, unet, scheduler, config,
+                    output_filename=f"sample_step_{global_step}.png"
+                )
+                # --- Log Images to WandB (Commented Out) ---
+                # if config.use_wandb and wandb_run is not None and generated_images:
+                #      wandb_images = [wandb.Image(img, caption=prompt) for img, prompt in zip(generated_images, sample_prompts)]
+                #      log_to_wandb({"validation/samples": wandb_images}, step=global_step)
+
+                unet.train() # Switch back to train mode
+
+            # --- Save Model Checkpoint ---
+            if global_step % config.save_model_frequency == 0:
+                 checkpoint_path = os.path.join(config.output_dir, f"checkpoint_step_{global_step}.pth")
+                 save_checkpoint(unet, optimizer, None, epoch, global_step, checkpoint_path)
+                 # Optionally save a 'latest' checkpoint too
+                 latest_checkpoint_path = os.path.join(config.output_dir, "latest_checkpoint.pth")
+                 save_checkpoint(unet, optimizer, None, epoch, global_step, latest_checkpoint_path)
+
+        # End of Epoch
+        avg_epoch_loss = epoch_loss / len(dataloader)
+        print(f"End of Epoch {epoch+1}, Average Loss: {avg_epoch_loss:.4f}")
+        # --- Log Epoch Loss to WandB (Commented Out) ---
+        # log_to_wandb({"train/epoch_loss": avg_epoch_loss, "epoch": epoch + 1}, step=global_step)
+
+
+    # --- End of Training ---
+    print("Training finished.")
+    # Save final model
+    final_model_path = os.path.join(config.output_dir, "final_model.pth")
+    save_checkpoint(unet, optimizer, None, config.num_epochs, global_step, final_model_path)
+
+    # --- Close WandB Run (Commented Out) ---
+    # if config.use_wandb and wandb_run is not None:
+    #     wandb.finish()
+
+
+# --- Main Runner (Simulates main_runner.py) ---
+
+if __name__ == "__main__":
+    print("Roger's Stable Diffusion Reimplementation - Main Runner")
+
+    # Example: Initialize configuration
+    training_config = TrainingConfig()
+    # Adjust config parameters if needed, e.g., from command line args
+    # training_config.num_epochs = 10 # Example override
+
+    # --- Option 1: Run Training ---
+    print("\nStarting Training Mode...")
+    train_model(training_config)
+
+    # --- Option 2: Run Inference (Example after training or loading) ---
+    # print("\nStarting Inference Mode...")
+    # # Ensure models are loaded (either from training or checkpoint)
+    # # This part requires loading a trained UNet checkpoint if not just trained.
+    # device = training_config.device
+    # vae_inf = VariationalAutoencoderWrapper(training_config.pretrained_vae_name_or_path, device)
+    # text_encoder_inf = TextEncoderInterface(training_config.pretrained_clip_name_or_path, device)
+    # unet_inf = NoisePredictorUNet().to(device)
+    # scheduler_inf = DiffusionScheduler(device=device)
+
+    # # Load the trained UNet weights
+    # try:
+    #     final_checkpoint_path = os.path.join(training_config.output_dir, "final_model.pth")
+    #     # Use a simplified load function if optimizer/scheduler state isn't needed
+    #     unet_inf.load_state_dict(torch.load(final_checkpoint_path, map_location=device)['model_state_dict'])
+    #     print(f"Loaded trained UNet weights from {final_checkpoint_path}")
+    # except FileNotFoundError:
+    #     print(f"Error: Trained UNet checkpoint not found at {final_checkpoint_path}. Cannot run inference.")
+    #     exit()
+    # except Exception as e:
+    #      print(f"Error loading UNet weights: {e}")
+    #      exit()
+
+
+    # # Define prompts for inference
+    # inference_prompts = [
+    #     "A high-resolution photograph of an astronaut riding a horse on the moon",
+    #     "A watercolor painting of a cozy cafe on a rainy day",
+    # ]
+
+    # # Generate images
+    # generate_samples(
+    #     prompts=inference_prompts,
+    #     vae=vae_inf,
+    #     text_encoder=text_encoder_inf,
+    #     unet=unet_inf,
+    #     scheduler=scheduler_inf,
+    #     config=training_config,
+    #     output_filename="inference_output.png"
+    # )
+
+    # --- Option 3: Run WandB Sweep Agent (Commented Out) ---
+    # print("\nStarting WandB Sweep Agent Mode...")
+    # import wandb # Make sure wandb is imported if running this
+    # sweep_config = get_wandb_sweep_config()
+    # sweep_id = wandb.sweep(sweep=sweep_config, project=training_config.wandb_project_name)
+    # print(f"Created WandB sweep with ID: {sweep_id}")
+    # print(f"Run the following command to start an agent:")
+    # print(f"wandb agent {sweep_id}")
+    # # Define a function to be called by the agent (which wraps train_model)
+    # def sweep_train_wrapper():
+    #      # wandb.init() will be called by the agent
+    #      current_run_config = TrainingConfig() # Start with defaults
+    #      # Override defaults with sweep config
+    #      if wandb.config:
+    #           for key, value in wandb.config.items():
+    #                if hasattr(current_run_config, key):
+    #                     setattr(current_run_config, key, value)
+    #                     print(f"Sweep overriding config.{key} = {value}")
+    #           # Ensure wandb logging is enabled for sweeps
+    #           current_run_config.use_wandb = True
+    #           # Potentially update run name based on sweep params for clarity
+    #           # current_run_config.wandb_run_name = f"sweep_lr_{wandb.config.learning_rate}_bs_{wandb.config.train_batch_size}"
+    #      train_model(current_run_config) # Train with sweep hyperparameters
+    # # Start the agent (this usually runs in a separate process/command line)
+    # # wandb.agent(sweep_id, function=sweep_train_wrapper, count=5) # Example: run 5 trials
+
+
+    print("\nRoger's script finished.")
