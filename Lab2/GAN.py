@@ -10,6 +10,7 @@ import numpy as np
 import tqdm
 import os
 import wandb
+import sys
 
 
 # Hyperparameters
@@ -77,6 +78,7 @@ def cGANTraining(G, D, loss_fn, train_loader):
     for it, (X_real, labels) in enumerate(t):
         # Prepare real data
         X_real = X_real.float().to(device)
+        labels.to(device)
 
         # Sample noise and labels
         z = torch.randn(X_real.size(0), Z_dim).to(device)
