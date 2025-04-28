@@ -10,8 +10,8 @@ import numpy as np
 import tqdm
 import os
 import wandb
-import sys
-
+from torch.autograd import Variable
+import matplotlib.pyplot as plt
 
 # Hyperparameters
 mb_size = 64
@@ -41,12 +41,13 @@ def xavier_init(m):
 class Generator(nn.Module):
     def __init__(self, z_dim, h_dim, x_dim):
         super(Generator, self).__init__()
-        self.fc1 = nn.Linear(z_dim, h_dim)
+        self.fc1 = nn.Linear(z_dim+10, h_dim)
         self.fc2 = nn.Linear(h_dim, x_dim)
         self.apply(xavier_init)
 
-    def forward(self, z):
-        h = F.relu(self.fc1(z))
+    def forward(self, z, c):
+        inputs = torch.cat([z, c], 1)
+        h = F.relu(self.fc1(inputs))
         out = torch.sigmoid(self.fc2(h))
         return out
 
@@ -54,12 +55,13 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, x_dim, h_dim):
         super(Discriminator, self).__init__()
-        self.fc1 = nn.Linear(x_dim, h_dim)
+        self.fc1 = nn.Linear(x_dim+10, h_dim)
         self.fc2 = nn.Linear(h_dim, 1)
         self.apply(xavier_init)
 
-    def forward(self, x):
-        h = F.relu(self.fc1(x))
+    def forward(self, x, c):
+        inputs = torch.cat([x, c], 1)
+        h = F.relu(self.fc1(inputs))
         out = torch.sigmoid(self.fc2(h))
         return out
 
@@ -73,12 +75,13 @@ def cGANTraining(G, D, loss_fn, train_loader):
     D_loss_real_total = 0
     D_loss_fake_total = 0
     G_loss_total = 0
+    #fancy progress bar thingy
     t = tqdm.tqdm(train_loader)
     
     for it, (X_real, labels) in enumerate(t):
         # Prepare real data
         X_real = X_real.float().to(device)
-        labels.to(device)
+        c = F.one_hot(labels.to(device), 10).float()
 
         # Sample noise and labels
         z = torch.randn(X_real.size(0), Z_dim).to(device)
@@ -86,9 +89,9 @@ def cGANTraining(G, D, loss_fn, train_loader):
         zeros_label = torch.zeros(X_real.size(0), 1).to(device)
 
         # ================= Train Discriminator =================
-        G_sample = G(z)
-        D_real = D(X_real)
-        D_fake = D(G_sample.detach())
+        G_sample = G(z, c)
+        D_real = D(X_real, c)
+        D_fake = D(G_sample.detach(), c)
 
         D_loss_real = loss_fn(D_real, ones_label)
         D_loss_fake = loss_fn(D_fake, zeros_label)
@@ -102,8 +105,8 @@ def cGANTraining(G, D, loss_fn, train_loader):
 
         # ================= Train Generator ====================
         z = torch.randn(X_real.size(0), Z_dim).to(device)
-        G_sample = G(z)
-        D_fake = D(G_sample)
+        G_sample = G(z, c)
+        D_fake = D(G_sample, c)
 
         G_loss = loss_fn(D_fake, ones_label)
         G_loss_total += G_loss.item()
@@ -134,7 +137,11 @@ def save_sample(G, epoch, mb_size, Z_dim):
     G.eval()
     with torch.no_grad():
         z = torch.randn(mb_size, Z_dim).to(device)
-        samples = G(z).detach().cpu().numpy()[:16]
+        c = np.zeros(shape=[mb_size, 10])
+        c = torch.from_numpy(c)
+        z = z.to(torch.float32)
+        c = c.to(torch.float32)
+        samples = G(z, c).detach().cpu().numpy()[:16]
 
     fig = plt.figure(figsize=(4, 4))
     gs = gridspec.GridSpec(4, 4)
@@ -207,6 +214,30 @@ for epoch in range(epochs):
 
     save_sample(G, epoch, mb_size, Z_dim)
 
+
+def generate_digit(G, digit, Z_dim, num_classes=10):
+    G.eval()
+
+    # Create a batch of noise
+    z = torch.randn(1, Z_dim).to(device)
+
+    # Create the label
+    label = torch.tensor([digit], dtype=torch.long).to(device)
+    label_onehot = F.one_hot(label, num_classes=num_classes).float()
+
+    # Generate an image
+    with torch.no_grad():
+        generated_img = G(z, label_onehot)
+
+    return generated_img
+
+digit = 7
+generated_img = generate_digit(G, digit, Z_dim)
+generated_img = generated_img.cpu().view(28, 28)  
+plt.imshow(generated_img, cmap='gray')
+plt.title(f"Generated digit: {digit}")
+plt.axis('off')
+plt.show()
 
 # Inference    
 # G.load_state_dict(torch.load('checkpoints/G_best.pth'))
