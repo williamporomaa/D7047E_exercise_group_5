@@ -12,12 +12,15 @@ import os
 import wandb
 from torch.autograd import Variable
 import matplotlib.pyplot as plt
+from digit_gen import generate_grid
 
 # Hyperparameters
 mb_size = 64
 Z_dim = 1000
 h_dim = 128
 lr = 1e-3
+epochs = 100
+#allowed epochs = number of epochs before early stopping = patience
 
 # Load MNIST data
 transform = transforms.Compose([
@@ -133,7 +136,7 @@ def cGANTraining(G, D, loss_fn, train_loader):
 
 
 def save_sample(G, epoch, mb_size, Z_dim):
-    out_dir = "out_vanila_GAN2"
+    out_dir = "out_CGAN"
     G.eval()
     with torch.no_grad():
         z = torch.randn(mb_size, Z_dim).to(device)
@@ -198,8 +201,7 @@ best_g_loss = float('inf')  # Initialize best generator loss
 save_dir = 'checkpoints'
 os.makedirs(save_dir, exist_ok=True)
 
-#Train epochs
-epochs = 100
+last_improvement = 0
 
 for epoch in range(epochs):
     G, D, G_loss_avg, D_loss_avg= cGANTraining(G, D, loss_fn, train_loader)
@@ -211,36 +213,17 @@ for epoch in range(epochs):
         torch.save(G.state_dict(), os.path.join(save_dir, 'G_best.pth'))
         torch.save(D.state_dict(), os.path.join(save_dir, 'D_best.pth'))
         print(f"Saved Best Models at epoch {epoch} | G_loss: {best_g_loss:.4f}")
+        last_improvement = 0
+    else:
+        last_improvement += 1
+    if last_improvement >= 100:
+        print("early stopping due to {last_improvement} epochs of no progress")
+        break
 
     save_sample(G, epoch, mb_size, Z_dim)
 
-
-def generate_digit(G, digit, Z_dim, num_classes=10):
-    G.eval()
-
-    # Create a batch of noise
-    z = torch.randn(1, Z_dim).to(device)
-
-    # Create the label
-    label = torch.tensor([digit], dtype=torch.long).to(device)
-    label_onehot = F.one_hot(label, num_classes=num_classes).float()
-
-    # Generate an image
-    with torch.no_grad():
-        generated_img = G(z, label_onehot)
-
-    return generated_img
-
-digit = 7
-generated_img = generate_digit(G, digit, Z_dim)
-generated_img = generated_img.cpu().view(28, 28)  
-plt.imshow(generated_img, cmap='gray')
-plt.title(f"Generated digit: {digit}")
-plt.axis('off')
-plt.show()
-
 # Inference    
-# G.load_state_dict(torch.load('checkpoints/G_best.pth'))
-# G.eval()
+G.load_state_dict(torch.load('checkpoints/G_best.pth'))
+G.eval()
 
-# save_sample(G, "best", mb_size, Z_dim)
+generate_grid(G, Z_dim, device)

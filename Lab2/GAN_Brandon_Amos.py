@@ -10,7 +10,6 @@ import numpy as np
 import tqdm
 import os
 import wandb
-import sys
 
 
 # Hyperparameters
@@ -66,7 +65,7 @@ class Discriminator(nn.Module):
 
 
 # Training
-def cGANTraining(G, D, loss_fn, train_loader):
+def cGANTraining(G, D, train_loader):
     G.train()
     D.train()
 
@@ -75,39 +74,52 @@ def cGANTraining(G, D, loss_fn, train_loader):
     G_loss_total = 0
     t = tqdm.tqdm(train_loader)
     
-    for it, (X_real, labels) in enumerate(t):
+    for it, (X_real, _) in enumerate(t):
         # Prepare real data
         X_real = X_real.float().to(device)
-        labels.to(device)
+        batch_size = X_real.size(0)
 
-        # Sample noise and labels
-        z = torch.randn(X_real.size(0), Z_dim).to(device)
-        ones_label = torch.ones(X_real.size(0), 1).to(device)
-        zeros_label = torch.zeros(X_real.size(0), 1).to(device)
+        # Prepare labels
+        ones_label = torch.ones(batch_size, 1).to(device)
+        zeros_label = torch.zeros(batch_size, 1).to(device)
 
         # ================= Train Discriminator =================
+        # Sample noise
+        z = torch.randn(batch_size, Z_dim).to(device)
+        
+        # Generate fake samples
         G_sample = G(z)
+        
+        # Get discriminator outputs
         D_real = D(X_real)
         D_fake = D(G_sample.detach())
 
-        D_loss_real = loss_fn(D_real, ones_label)
-        D_loss_fake = loss_fn(D_fake, zeros_label)
-        D_loss = D_loss_real + D_loss_fake
-        D_loss_real_total += D_loss_real.item()
-        D_loss_fake_total += D_loss_fake.item()
-
+        # Calculate discriminator loss
+        D_loss, D_loss_real, D_loss_fake = discriminator_loss(D_real, D_fake, ones_label, zeros_label)
+        
+        # Update discriminator
         D_solver.zero_grad()
         D_loss.backward()
         D_solver.step()
 
+        D_loss_real_total += D_loss_real.item()
+        D_loss_fake_total += D_loss_fake.item()
+
         # ================= Train Generator ====================
-        z = torch.randn(X_real.size(0), Z_dim).to(device)
+        # Sample noise
+        z = torch.randn(batch_size, Z_dim).to(device)
+        
+        # Generate fake samples
         G_sample = G(z)
+        
+        # Get discriminator output for fake samples
         D_fake = D(G_sample)
 
-        G_loss = loss_fn(D_fake, ones_label)
+        # Calculate generator loss
+        G_loss = generator_loss(D_fake, ones_label)
         G_loss_total += G_loss.item()
 
+        # Update generator
         G_solver.zero_grad()
         G_loss.backward()
         G_solver.step()
@@ -126,6 +138,7 @@ def cGANTraining(G, D, loss_fn, train_loader):
     })
 
     return G, D, G_loss_avg, D_loss_avg
+
     
 
 
@@ -168,12 +181,46 @@ D = Discriminator(X_dim, h_dim).to(device)
 G_solver = optim.Adam(G.parameters(), lr=lr)
 D_solver = optim.Adam(D.parameters(), lr=lr)
 
-# Loss function
-def my_bce_loss(preds, targets):
+# Loss functions
+def discriminator_loss(D_real, D_fake, targets_real, targets_fake):
+    """
+    Calculates the discriminator loss using binary cross-entropy.
+    
+    Args:
+        D_real: Discriminator outputs for real images
+        D_fake: Discriminator outputs for fake images
+        targets_real: Target labels for real images (ones)
+        targets_fake: Target labels for fake images (zeros)
+        
+    Returns:
+        Total discriminator loss
+    """
+    real_loss = F.binary_cross_entropy(D_real, targets_real)
+    fake_loss = F.binary_cross_entropy(D_fake, targets_fake)
+    total_loss = real_loss + fake_loss
+    return total_loss, real_loss, fake_loss
+
+def generator_loss(D_fake, targets):
+    """
+    Calculates the generator loss using binary cross-entropy.
+    
+    Args:
+        D_fake: Discriminator outputs for fake images
+        targets: Target labels (ones)
+        
+    Returns:
+        Generator loss
+    """
+    return F.binary_cross_entropy(D_fake, targets)
+
+
+""" def my_bce_loss(preds, targets):
     return F.binary_cross_entropy(preds, targets)
 
 #loss_fn = nn.BCEWithLogitsLoss()
 loss_fn = my_bce_loss
+ """
+
 
 if wandb_log: 
     wandb.init(project="conditional-gan-mnist")
@@ -192,10 +239,10 @@ save_dir = 'checkpoints'
 os.makedirs(save_dir, exist_ok=True)
 
 #Train epochs
-epochs = 100
+epochs = 50
 
 for epoch in range(epochs):
-    G, D, G_loss_avg, D_loss_avg= cGANTraining(G, D, loss_fn, train_loader)
+    G, D, G_loss_avg, D_loss_avg = cGANTraining(G, D, train_loader)
 
     print(f'epoch{epoch}; D_loss: {D_loss_avg:.4f}; G_loss: {G_loss_avg:.4f}')
 
