@@ -1,3 +1,5 @@
 checkpoints/
 out_vanila_GAN2/
 wandb/
+__pycache__/
+out_CGAN/
