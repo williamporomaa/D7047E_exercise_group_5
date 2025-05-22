@@ -56,12 +56,17 @@ class QNetwork(nn.Module):
         # TODO: Deinfe your network (agent)
         # Look at Section 4.1 in the paper for help: https://arxiv.org/pdf/1312.5602v1.pdf
         self.network = nn.Sequential(
-
-
-
-
-
-            nn.Linear(512, env.single_action_space.n)                
+        nn.Conv2d(4, 16, kernel_size=8, stride=4),  # first layer convolves 32 filters
+        nn.ReLU(),
+        nn.Conv2d(16, 32, kernel_size=4, stride=2), #second layer 
+        nn.ReLU(),
+        nn.Conv2d(64, 64, kernel_size=3, stride=1),
+        nn.ReLU(),
+        nn.Flatten(),
+        nn.Linear(32 * 9 * 9, 256),
+        nn.ReLU(),
+        
+        nn.Linear(512, env.single_action_space.n)                           
         )
 
     def forward(self, x):
