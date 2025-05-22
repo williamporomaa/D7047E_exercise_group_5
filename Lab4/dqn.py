@@ -60,10 +60,8 @@ class QNetwork(nn.Module):
         nn.ReLU(),
         nn.Conv2d(16, 32, kernel_size=4, stride=2), #second layer 
         nn.ReLU(),
-        nn.Conv2d(64, 64, kernel_size=3, stride=1),
-        nn.ReLU(),
         nn.Flatten(),
-        nn.Linear(32 * 9 * 9, 256),
+        nn.Linear(32 * 9 * 9, 256), #final fc layer, input size based on last layer
         nn.ReLU(),
         
         nn.Linear(512, env.single_action_space.n)                           
