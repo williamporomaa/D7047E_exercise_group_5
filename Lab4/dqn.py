@@ -26,9 +26,9 @@ from stable_baselines3.common.buffers import ReplayBuffer
 
 
 # Creates our gym environment and with all our wrappers.
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, seed, idx, capture_video, run_name, render_mode=None):
     def thunk():
-        env = gym.make(env_id)
+        env = gym.make("ALE/BreakoutNoFrameskip-v4", render_mode="human")  # Pass render_mode here
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
@@ -48,6 +48,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         return env
 
     return thunk
+
 
 
 class QNetwork(nn.Module):
@@ -86,7 +87,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(params.env_id, params.seed, 0, params.capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv([make_env(params.env_id, params.seed, 0, params.capture_video, run_name, render_mode="human")])
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     q_network = QNetwork(envs).to(device)
@@ -107,15 +108,18 @@ if __name__ == "__main__":
         handle_timeout_termination=True,
     )
 
-    obs = envs.reset()
+    obs, info = envs.reset(params.seed)
+
+
     for global_step in range(params.total_timesteps):
         # Here we get epsilon for our epislon greedy.
         epsilon = linear_schedule(params.start_e, params.end_e, params.exploration_fraction * params.total_timesteps, global_step)
 
         if random.random() < epsilon:
-            actions = # TODO: sample a random action from the environment 
+            actions =  np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)]) # sample a random action from the environment
         else:
-            q_values = # TODO: get q_values from the network you defined, what should the network receive as input?
+            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device) #Converts observations into proper tensor format. Ensures the model is evaluated on GPU (if available) and in float format.
+            q_values = q_network(obs_tensor)  #get q_values from the network you defined, what should the network receive as input?
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
         # Take a step in the environment
@@ -147,11 +151,11 @@ if __name__ == "__main__":
 
                 with torch.no_grad():
                     # Now we calculate the y_j for non-terminal phi.
-                    target_max, _ = # TODO: Calculate max Q
-                    td_target = # TODO: Calculate the td_target (y_j)
+                    target_max, _ = target_network(data.next_observations).max(dim=1)[0]   # Calculate max Q
+                    td_target = data.rewards.flatten() + params.gamma * target_max * (1 - data.dones.flatten())     # Calculate the td_target (y_j)
 
-                old_val = q_network(?).gather(1, data.actions).squeeze()
-                loss = F.mse_loss(?, ?) 
+                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+                loss = F.mse_loss(old_val, td_target) 
 
                 # perform our gradient decent step
                 optimizer.zero_grad()
