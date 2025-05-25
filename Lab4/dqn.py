@@ -1,3 +1,4 @@
+
 import os
 import random
 import time
@@ -26,9 +27,9 @@ from stable_baselines3.common.buffers import ReplayBuffer
 
 
 # Creates our gym environment and with all our wrappers.
-def make_env(env_id, seed, idx, capture_video, run_name, render_mode=None):
+def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
-        env = gym.make("ALE/BreakoutNoFrameskip-v4", render_mode="human")  # Pass render_mode here
+        env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
@@ -65,7 +66,7 @@ class QNetwork(nn.Module):
         nn.Linear(32 * 9 * 9, 256), #final fc layer, input size based on last layer
         nn.ReLU(),
         
-        nn.Linear(512, env.single_action_space.n)                           
+        nn.Linear(256, env.single_action_space.n)
         )
 
     def forward(self, x):
@@ -78,16 +79,18 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 if __name__ == "__main__":
     run_name = f"{params.env_id}__{params.exp_name}__{params.seed}__{int(time.time())}"
-
+    best_return = -float('inf')
     random.seed(params.seed)
     np.random.seed(params.seed)
     torch.manual_seed(params.seed)
     torch.backends.cudnn.deterministic = params.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print("CUDA available:", torch.cuda.is_available())
+    print("GPU name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")
+    
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(params.env_id, params.seed, 0, params.capture_video, run_name, render_mode="human")])
+    envs = gym.vector.SyncVectorEnv([make_env(params.env_id, params.seed, 0, params.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     q_network = QNetwork(envs).to(device)
@@ -108,7 +111,7 @@ if __name__ == "__main__":
         handle_timeout_termination=True,
     )
 
-    obs, info = envs.reset(params.seed)
+    obs = envs.reset()
 
 
     for global_step in range(params.total_timesteps):
@@ -130,6 +133,16 @@ if __name__ == "__main__":
             if "episode" in info.keys():
                 print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                 break
+        for idx, done in enumerate(dones):
+            if done:
+                episodic_return = infos[idx].get('episode', {}).get('r', 0)
+                if episodic_return > best_return and global_step > params.learning_starts:
+                    best_return = episodic_return
+                    best_model_path = f"Lab4/{run_name}/best_model_{global_step}.pth"
+                    os.makedirs(os.path.dirname(best_model_path), exist_ok=True)  # Ensure directory exists
+                    torch.save(q_network.state_dict(), best_model_path)
+                    print(f"New best model saved with return {best_return} to {best_model_path}")
+                
 
         # Save data to replay buffer
         real_next_obs = next_obs.copy()
@@ -150,11 +163,16 @@ if __name__ == "__main__":
                 # data.observation, data.rewards, data.dones, data.actions
 
                 with torch.no_grad():
+                    rewards = data.rewards.clone().detach().to(torch.float32)
+                    dones = data.dones.clone().detach().to(torch.float32)
+                    rewards = rewards.squeeze(1)  # Adjust the number '32' based on your actual batch size
+                    dones = dones.squeeze(1)
+                    
                     # Now we calculate the y_j for non-terminal phi.
-                    target_max, _ = target_network(data.next_observations).max(dim=1)[0]   # Calculate max Q
-                    td_target = data.rewards.flatten() + params.gamma * target_max * (1 - data.dones.flatten())     # Calculate the td_target (y_j)
-
-                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+                    target_max = q_network(data.next_observations.to(device=device, dtype=torch.float32)).max(dim=1)[0]   # Calculate max Q
+                    td_target = rewards + (params.gamma * target_max * (1-dones))
+                    
+                old_val = q_network(data.observations).gather(1, data.actions).squeeze(1)
                 loss = F.mse_loss(old_val, td_target) 
 
                 # perform our gradient decent step
