@@ -58,12 +58,12 @@ class QNetwork(nn.Module):
         # TODO: Deinfe your network (agent)
         # Look at Section 4.1 in the paper for help: https://arxiv.org/pdf/1312.5602v1.pdf
         self.network = nn.Sequential(
-        nn.Conv2d(4, 16, kernel_size=8, stride=4),  # first layer convolves 32 filters
+        nn.Conv2d(4, 16, kernel_size=8, stride=4),  # first layer convolves 32 filters 20x20 output
         nn.ReLU(),
-        nn.Conv2d(16, 32, kernel_size=4, stride=2), #second layer 
+        nn.Conv2d(16, 32, kernel_size=4, stride=2), #second layer 9x9 output,  increase number of learned features and more edges
         nn.ReLU(),
         nn.Flatten(),
-        nn.Linear(32 * 9 * 9, 256), #final fc layer, input size based on last layer
+        nn.Linear(32 * 9 * 9, 256), #final fc layer, input size based on last layer, 
         nn.ReLU(),
         
         nn.Linear(256, env.single_action_space.n)
@@ -170,7 +170,7 @@ if __name__ == "__main__":
                     
                     # Now we calculate the y_j for non-terminal phi.
                     target_max = q_network(data.next_observations.to(device=device, dtype=torch.float32)).max(dim=1)[0]   # Calculate max Q
-                    td_target = rewards + (params.gamma * target_max * (1-dones))
+                    td_target = rewards + (params.gamma * target_max * (1-dones)) # actuall Q
                     
                 old_val = q_network(data.observations).gather(1, data.actions).squeeze(1)
                 loss = F.mse_loss(old_val, td_target) 
